@@ -1,51 +1,79 @@
-from langchain.tools import tool
-
 import os
 import re
-import requests
 
-from dotenv import load_dotenv
-from tavily import TavilyClient
-from bs4 import BeautifulSoup
-from readability import Document
+import requests
 import trafilatura
 
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from langchain.tools import tool
+from langchain_core.documents import Document
+from langchain_community.document_loaders import WebBaseLoader
+from langchain_community.document_transformers import BeautifulSoupTransformer
+from readability import Document as ReadabilityDocument
+from tavily import TavilyClient
 
-# Load environment variables
+
 load_dotenv()
 
-# Create Tavily client
-tavily = TavilyClient(
-    api_key=os.getenv("TAVILY_API_KEY")
-)
+
+TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
+
+if not TAVILY_API_KEY:
+    raise ValueError("TAVILY_API_KEY is not set in .env")
+
+
+tavily = TavilyClient(api_key=TAVILY_API_KEY)
+
+
+# The Groq free tier allows only 8000 tokens per minute, so every tool
+# result has to stay small. Long tool output also bloats the agent
+# context on every follow-up turn.
+MAX_SEARCH_SNIPPET_CHARS = 600
+MAX_SEARCH_TOTAL_CHARS = 4000
+MAX_PAGE_CHARS = 6000
 
 
 @tool
 def web_search(query: str) -> str:
     """
-    Search the web for recent and reliable information about a topic.
-    Returns titles, URLs, and snippets.
+    Search the web for recent and relevant information.
     """
 
     try:
-        results = tavily.search(
+        response = tavily.search(
             query=query,
-            max_results=5
+            max_results=5,
+            search_depth="advanced",
         )
 
-        output = []
+        results = response.get("results", [])
 
-        for result in results.get("results", []):
-            output.append(
-                f"Title: {result.get('title', 'No title')}\n"
-                f"URL: {result.get('url', 'No URL')}\n"
-                f"Snippet: {result.get('content', '')[:300]}\n"
-            )
-
-        if not output:
+        if not results:
             return "No search results found."
 
-        return "\n----\n".join(output)
+        formatted_results = []
+
+        for i, result in enumerate(results, start=1):
+            title = result.get("title", "No title")
+            url = result.get("url", "No URL")
+            content = result.get("content", "No content")
+
+            content = re.sub(r"\s+", " ", content).strip()
+
+            if len(content) > MAX_SEARCH_SNIPPET_CHARS:
+                content = content[:MAX_SEARCH_SNIPPET_CHARS] + " ..."
+
+            formatted_results.append(
+                f"""
+Result {i}
+Title: {title}
+URL: {url}
+Content: {content}
+"""
+            )
+
+        return "\n".join(formatted_results)[:MAX_SEARCH_TOTAL_CHARS]
 
     except Exception as e:
         return f"Web search failed: {str(e)}"
@@ -54,131 +82,106 @@ def web_search(query: str) -> str:
 @tool
 def scrape_url(url: str) -> str:
     """
-    Scrape and extract clean readable content from a URL.
-
-    Uses multiple extraction methods for better reliability.
+    Scrape and extract readable text from a webpage.
     """
 
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0 Safari/537.36"
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/154.0.0.0 Safari/537.36"
         ),
-        "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://www.google.com/",
     }
 
     try:
-        # --------------------------------------------------
-        # 1. Fetch page
-        # --------------------------------------------------
-
         response = requests.get(
             url,
             headers=headers,
-            timeout=15
+            timeout=15,
         )
 
         response.raise_for_status()
 
         html = response.text
 
-        # --------------------------------------------------
-        # 2. Try Trafilatura first
-        # --------------------------------------------------
+        # -----------------------------------------
+        # Method 1: trafilatura
+        # -----------------------------------------
 
-        extracted = trafilatura.extract(
+        extracted_text = trafilatura.extract(
             html,
             include_comments=False,
-            include_tables=False
+            include_tables=True,
+            include_links=True,
         )
 
-        if extracted and len(extracted.strip()) > 200:
-            cleaned = re.sub(r"\s+", " ", extracted).strip()
-            return cleaned[:5000]
+        if extracted_text:
+            cleaned_text = re.sub(r"\s+", " ", extracted_text).strip()
 
-        # --------------------------------------------------
-        # 3. Try Readability + BeautifulSoup
-        # --------------------------------------------------
+            if len(cleaned_text) > 200:
+                return cleaned_text[:MAX_PAGE_CHARS]
 
-        doc = Document(html)
+        # -----------------------------------------
+        # Method 2: readability + BeautifulSoup
+        # -----------------------------------------
 
-        clean_html = doc.summary()
+        readability_doc = ReadabilityDocument(html)
 
-        soup = BeautifulSoup(
-            clean_html,
-            "html.parser"
+        readable_html = readability_doc.summary()
+
+        soup = BeautifulSoup(readable_html, "html.parser")
+
+        text = soup.get_text(
+            separator=" ",
+            strip=True,
         )
 
-        for tag in soup([
-            "script",
-            "style",
-            "nav",
-            "footer",
-            "header",
-            "aside",
-            "form"
-        ]):
+        text = re.sub(r"\s+", " ", text).strip()
+
+        if len(text) > 200:
+            return text[:MAX_PAGE_CHARS]
+
+        # -----------------------------------------
+        # Method 3: BeautifulSoup fallback
+        # -----------------------------------------
+
+        soup = BeautifulSoup(html, "html.parser")
+
+        for tag in soup(
+            [
+                "script",
+                "style",
+                "noscript",
+                "header",
+                "footer",
+                "nav",
+                "aside",
+            ]
+        ):
             tag.decompose()
 
         text = soup.get_text(
             separator=" ",
-            strip=True
+            strip=True,
         )
 
-        if text and len(text.strip()) > 200:
-            cleaned = re.sub(r"\s+", " ", text).strip()
-            return cleaned[:5000]
+        text = re.sub(r"\s+", " ", text).strip()
 
-        # --------------------------------------------------
-        # 4. Final BeautifulSoup fallback
-        # --------------------------------------------------
+        if not text:
+            return "Could not extract readable content from this URL."
 
-        soup = BeautifulSoup(
-            html,
-            "html.parser"
-        )
-
-        for tag in soup([
-            "script",
-            "style",
-            "nav",
-            "footer",
-            "header",
-            "aside",
-            "form"
-        ]):
-            tag.decompose()
-
-        text = soup.get_text(
-            separator=" ",
-            strip=True
-        )
-
-        cleaned = re.sub(
-            r"\s+",
-            " ",
-            text
-        ).strip()
-
-        if cleaned:
-            return cleaned[:5000]
-
-        return "Could not extract meaningful content from the page."
-
-    # ------------------------------------------------------
-    # Error handling
-    # ------------------------------------------------------
+        return text[:MAX_PAGE_CHARS]
 
     except requests.exceptions.Timeout:
-        return "Request timed out while scraping the URL."
+        return "Failed to scrape URL: request timed out."
 
     except requests.exceptions.HTTPError as e:
-        return f"HTTP error occurred: {e}"
+        return f"Failed to scrape URL: HTTP error - {e}"
 
     except requests.exceptions.RequestException as e:
-        return f"Request failed: {e}"
+        return f"Failed to scrape URL: request error - {e}"
 
     except Exception as e:
-        return f"Could not scrape URL: {e}"
+        return f"Failed to scrape URL: {str(e)}"
